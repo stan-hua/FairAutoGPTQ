@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import transformers
 
-from .quantizer import Quantizer
+from auto_gptq.quantization.quantizer import Quantizer
 
 
 logger = getLogger(__name__)
@@ -27,11 +27,34 @@ class GPTQ:
             W = W.t()
         self.rows = W.shape[0]
         self.columns = W.shape[1]
-        self.H = torch.zeros((self.columns, self.columns), device=self.dev)
-        self.nsamples = 0
+
+        self.H = {
+            "pos": torch.zeros((self.columns, self.columns), device=self.dev),
+            "neg": torch.zeros((self.columns, self.columns), device=self.dev)
+        }
+        self.nsamples = {
+            "pos": 0,
+            "neg": 0,
+        }
         self.quantizer = Quantizer()
 
+        # Flag used in determining if sample is positive/negative
+        # NOTE: We want good reconstruction on a positive batch and poor on negative
+        self.is_positive_batch = True
+
+
     def add_batch(self, inp, out):
+        """
+        Hook to get input/output of each layer, and iteratively approximate the
+        Hessian matrix.
+
+        Parameters
+        ----------
+        inp : torch.Tensor
+            Layer input
+        out : torch.Tensor
+            Layer output
+        """
         if os.environ.get("DEBUG"):
             self.inp1 = inp
             self.out1 = out
@@ -52,12 +75,18 @@ class GPTQ:
             inp = unfold(inp)
             inp = inp.permute([1, 0, 2])
             inp = inp.flatten(1)
-        self.H *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples += tmp
+        # Hessian dampening factor
+        key = "pos" if self.is_positive_batch else "neg"
+        self.H[key] *= self.nsamples[key] / (self.nsamples[key] + tmp)
+        self.nsamples[key] += tmp
+
         # inp = inp.float()
-        inp = math.sqrt(2 / self.nsamples) * inp.float()
+        inp = math.sqrt(2 / self.nsamples[key]) * inp.float()
         # self.H += 2 / self.nsamples * inp.matmul(inp.t())
-        self.H += inp.matmul(inp.t())
+
+        # Update moving average of Hessian
+        self.H[key] += inp.matmul(inp.t())
+
 
     def fasterquant(
         self,
@@ -81,7 +110,7 @@ class GPTQ:
 
         H = self.H
         del self.H
-        dead = torch.diag(H) == 0
+        dead = torch.diag(H["pos"]) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
 
@@ -101,22 +130,57 @@ class GPTQ:
                 zero.append(quantizer.zero)
                 groups.append(quantizer)
 
+        # NOTE: This isn't tested
         if actorder:
-            perm = torch.argsort(torch.diag(H), descending=True)
+            raise NotImplementedError("Not tested")
+            perm = torch.argsort(torch.diag(H["pos"]), descending=True)
             W = W[:, perm]
-            H = H[perm][:, perm]
+            H["pos"] = H["pos"][perm][:, perm]
             invperm = torch.argsort(perm)
 
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
 
-        damp = percdamp * torch.mean(torch.diag(H))
+        # Dampen Hessian for positive samples with Hessian for negative samples
+        H_pos = H["pos"]
+        if self.nsamples["neg"] > 0:
+            # Compute unit-norm eigenvectors for Hessian of negative sample
+            lambda_neg, v_neg = torch.linalg.eigh(H["neg"])
+
+            # Project positive sample Hessian onto the negative sample eigenvectors
+            # to obtain a score (consider each projection independently)
+            scores_pos = (v_neg.T @ H["pos"] @ v_neg).diag()
+
+            # The equivalent projection of the negative sample Hessian results in
+            # the eigenvalues
+            scores_neg = lambda_neg
+
+            # Compute dampening factor based on difference between projection scores
+            # NOTE: Directions where negative samples Hessian > positive samples Hessian
+            #       should be dampened. And directions where positive samples
+            #       Hessian > negative samples Hessian can also be strengthened
+            scores_diff = (scores_neg - scores_pos)
+            damp = 1 - (scores_diff / scores_diff.max())
+            # NOTE: Hessian needs to be positive-definite, so ensure damping factor
+            #       is at least 0.001
+            damp = torch.clamp(damp, min=0.001)
+
+            # Reconstructing positive sample Hessian matrix with dampened scores
+            H_pos = v_neg @ torch.diag(damp*scores_pos) @ v_neg.T
+
+        # (Dampen) Add constant to diagonal to ensure positive-definite to
+        #          ensure Cholesky Decomposition works fine
+        damp = percdamp * torch.mean(torch.diag(H_pos))
         diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+        H_pos[diag, diag] += damp
+
+        # Compute inverse of Hessian (with Cholesky decomposition)
+        H_lower = torch.linalg.cholesky(H_pos)
+        H_inv = torch.cholesky_inverse(H_lower)
+
+        # Compute Cholesky decomposition on inverse of Hessian
+        H_inv_upper = torch.linalg.cholesky(H_inv, upper=True)
+        Hinv = H_inv_upper
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -168,7 +232,7 @@ class GPTQ:
 
         torch.cuda.synchronize()
         logger.info(f"duration: {(time.time() - tick)}")
-        logger.info(f"avg loss: {torch.sum(Losses).item() / self.nsamples}")
+        logger.info(f"avg loss: {torch.sum(Losses).item() / self.nsamples['pos']}")
 
         group_size = group_size if group_size != -1 else self.columns
         if static_groups and actorder:

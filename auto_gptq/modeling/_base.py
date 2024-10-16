@@ -175,6 +175,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
     def quantize(
         self,
         examples: List[Dict[str, Union[List[int], torch.LongTensor]]],
+        pos_example_flags : List[bool] = None,
         batch_size: int = 1,
         use_triton: bool = False,
         use_cuda_fp16: bool = True,
@@ -315,7 +316,15 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                 handles = []
                 for name in subset:
                     handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+                # NOTE: Modified this section
                 for j in range(num_batches):
+                    # Modify GPTQ internal flag to indicate if this is a
+                    # positive or negative sample
+                    if pos_example_flags:
+                        for name in subset:
+                            gptq[name].is_positive_batch = pos_example_flags[j]
+
                     layer_input = []
                     for k, layer_inp in enumerate(layer_inputs[j]):
                         layer_input.append(move_to_device(layer_inp, cur_layer_device))
@@ -329,7 +338,11 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                         additional_layer_inputs["position_ids"] = layer_position_ids
                     for k, v in layer_input_kwargs[j].items():
                         additional_layer_inputs[k] = nested_move_to_device(v, cur_layer_device)
+
+                    # Pass stored input through layer
                     layer(*layer_input, **additional_layer_inputs)
+
+                # Remove forward hooks on each sub-module
                 for h in handles:
                     h.remove()
 
